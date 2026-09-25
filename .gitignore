@@ -6,4 +6,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+*.db
 .DS_Store

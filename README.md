@@ -102,6 +102,42 @@ Build your solution in **your own fork** of this repository.
 
 You do not need to create a participant folder in the organiser repository or open a pull request into the organiser repository.
 
+### Running the Foundation Locally (Phase 1)
+
+1. **Set up virtual environment:**
+   ```sh
+   python -m venv .venv
+   # On Windows:
+   .\.venv\Scripts\activate
+   # On Linux/macOS:
+   source .venv/bin/activate
+   ```
+
+2. **Install dependencies:**
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+3. **Configure environment:**
+   ```sh
+   cp .env.example .env
+   ```
+
+4. **Run the test suite:**
+   ```sh
+   pytest -v
+   ```
+
+5. **Start the FastAPI backend:**
+   ```sh
+   uvicorn src.main:app --reload --port 8000
+   ```
+
+6. **Verify health & agent endpoints:**
+   * Health check: `GET http://localhost:8000/health`
+   * Interactive API docs: `http://localhost:8000/docs`
+   * Main operation: `POST http://localhost:8000/agent`
+
 ---
 
 ## What you should focus on
