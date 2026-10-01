@@ -1,4 +1,4 @@
-"""Returns Manager Agent API endpoints (MOCK implementation for Phase 1)."""
+"""Returns Manager Agent API endpoints integrated with Gemini multimodal vision pipeline."""
 
 import hashlib
 import json
@@ -8,32 +8,45 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from src.config import ALLOWED_ORGS, GEMINI_MODEL
+from src.config import ALLOWED_ORGS
 from src.models.domain import (
-    Verdict,
-    PartStatus,
-    ObservedState,
     AmazonCondition,
     Disposition,
+    PartStatus,
     RecordStatus,
+    Verdict,
 )
 from src.models.request import ReturnAssessmentRequest
 from src.models.response import (
-    EvidenceRecord,
-    SubjectInfo,
     CheckResult,
     EvidenceItem,
-    PartStatusItem,
-    OutcomeResult,
+    EvidenceRecord,
     ImageRecord,
+    OutcomeResult,
+    PartStatusItem,
+    SubjectInfo,
 )
 from src.storage.records_repo import (
-    save_record,
     get_record,
     list_records,
+    save_record,
 )
+from src.vision.client import GeminiVisionClient
+from src.vision.condition_mapper import map_condition
+from src.vision.image_utils import validate_images
 
 router = APIRouter(tags=["Returns Manager Agent"])
+
+# Vision client instance (lazy init on first call)
+_vision_client: Optional[GeminiVisionClient] = None
+
+
+def get_vision_client() -> GeminiVisionClient:
+    """Get or create singleton vision client."""
+    global _vision_client
+    if _vision_client is None:
+        _vision_client = GeminiVisionClient()
+    return _vision_client
 
 
 def _compute_content_hash(data: dict) -> str:
@@ -46,10 +59,15 @@ def _compute_content_hash(data: dict) -> str:
 async def process_return(request: ReturnAssessmentRequest) -> EvidenceRecord:
     """Process a returned item parcel and generate a structured evidence record.
 
-    NOTE: Phase 1 provides a MOCK assessment pipeline conforming strictly to the
-    official evidence contract. Real multimodal vision inference is scheduled for Phase 2+.
+    Executes:
+    1. Multi-tenant isolation verification
+    2. Image validation and safe base64 decoding
+    3. Multimodal visual inspection via Gemini 2.5 Flash
+    4. Deterministic condition mapping (Amazon condition scale)
+    5. Deterministic rule-based disposition recommendation
+    6. Tamper-evident content hash generation & SQLite persistence
     """
-    # Multi-tenant isolation check (RULES.md §2.1)
+    # 1. Multi-tenant isolation check (RULES.md §2.1)
     if ALLOWED_ORGS and request.organization_id not in ALLOWED_ORGS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -60,96 +78,177 @@ async def process_return(request: ReturnAssessmentRequest) -> EvidenceRecord:
     record_suffix = uuid.uuid4().hex[:6].upper()
     record_id = f"RTN-{request.unit_id.replace('UNIT-', '')}-{record_suffix}"
 
-    # Prepare image metadata records
+    # 2. Image validation
+    valid_images, image_errors = validate_images(request.images)
+
     image_records = [
         ImageRecord(
             image_id=f"img_{i+1:03d}",
             filename=img.filename,
             storage_path=f"{request.organization_id}/{request.unit_id}/{img.filename}",
-            content_type=img.content_type or "image/jpeg",
-            size_bytes=len(img.data.encode("utf-8")) if img.data else 0,
-            hash_sha256=hashlib.sha256(img.filename.encode("utf-8")).hexdigest(),
+            content_type=img.mime_type,
+            size_bytes=img.size_bytes,
+            hash_sha256=hashlib.sha256(img.data).hexdigest(),
         )
-        for i, img in enumerate(request.images)
+        for i, img in enumerate(valid_images)
     ]
 
-    # MOCK Check 1: Identity
+    # 3. Vision Analysis
+    vision_client = get_vision_client()
+    if not valid_images:
+        err_reason = "; ".join(image_errors) if image_errors else "No photographic evidence provided for assessment."
+        from src.vision.client import create_fallback_observations, VisionPipelineResult
+        fallback_obs = create_fallback_observations(
+            ordered_sku=request.ordered_sku,
+            ordered_asin=request.ordered_asin,
+            parts_list=request.parts_list,
+            reason=err_reason,
+            primary_image="no_valid_image",
+        )
+        vision_result = VisionPipelineResult(
+            success=False,
+            observations=fallback_obs,
+            model_version=vision_client.model_name,
+            latency_ms=0,
+            error_message=err_reason,
+        )
+    else:
+        vision_result = vision_client.analyze_return(
+            ordered_sku=request.ordered_sku,
+            ordered_asin=request.ordered_asin,
+            parts_list=request.parts_list,
+            images=valid_images,
+        )
+
+    obs = vision_result.observations
+
+    # Build Check 1: Identity
+    identity_evidence = [
+        EvidenceItem(
+            evidence_id=f"ev_id_{record_suffix}",
+            claim=obs.identity.claim,
+            evidence_type="visual_match",
+            source=obs.identity.source_image,
+            observation=obs.identity.detail,
+            confidence=obs.identity.confidence,
+        )
+    ]
     identity_check = CheckResult(
         check_key="identity",
-        verdict=Verdict.PASS,
-        confidence=0.92,
-        detail=f"Returned item matches ordered SKU {request.ordered_sku} (ASIN: {request.ordered_asin}). Markings and physical design match reference catalogue.",
-        evidence=[
-            EvidenceItem(
-                evidence_id="ev_id_001",
-                claim=f"Returned parcel contains SKU {request.ordered_sku}",
-                evidence_type="visual_match",
-                source=image_records[0].filename if image_records else "inspection_camera_1",
-                observation="Brand typography and SKU label match catalogue reference specifications.",
-                confidence=0.92,
-            )
-        ],
-        model_version=f"{GEMINI_MODEL} (mock)",
-        latency_ms=120,
+        verdict=obs.identity.verdict,
+        confidence=obs.identity.confidence,
+        detail=obs.identity.detail,
+        evidence=identity_evidence,
+        model_version=vision_result.model_version,
+        latency_ms=vision_result.latency_ms,
     )
 
-    # MOCK Check 2: Completeness
+    # Build Check 2: Completeness
     parts_status_items = [
-        PartStatusItem(part=part, status=PartStatus.PRESENT, confidence=0.88)
-        for part in request.parts_list
+        PartStatusItem(
+            part=p.part_name,
+            status=p.status,
+            confidence=p.confidence,
+        )
+        for p in obs.completeness.parts
     ]
-    parts_detail = (
-        f"All {len(request.parts_list)} expected components verified present: {'; '.join(request.parts_list)}."
-        if request.parts_list
-        else "No expected accessories specified in catalogue."
-    )
+    comp_evidence = [
+        EvidenceItem(
+            evidence_id=f"ev_comp_{record_suffix}",
+            claim=obs.completeness.claim,
+            evidence_type="visual_observation",
+            source=obs.completeness.source_image,
+            observation=obs.completeness.detail,
+            confidence=obs.completeness.confidence,
+        )
+    ]
     completeness_check = CheckResult(
         check_key="completeness",
-        verdict=Verdict.PASS,
-        confidence=0.88,
-        detail=parts_detail,
-        evidence=[
-            EvidenceItem(
-                evidence_id="ev_comp_001",
-                claim="Expected parts and accessories present in package",
-                evidence_type="visual_observation",
-                source=image_records[0].filename if image_records else "inspection_camera_1",
-                observation="All required accessories identified and accounted for in parcel inspection photo.",
-                confidence=0.88,
-            )
-        ],
+        verdict=obs.completeness.verdict,
+        confidence=obs.completeness.confidence,
+        detail=obs.completeness.detail,
+        evidence=comp_evidence,
         parts_status=parts_status_items,
-        model_version=f"{GEMINI_MODEL} (mock)",
-        latency_ms=95,
+        model_version=vision_result.model_version,
+        latency_ms=0,
     )
 
-    # MOCK Check 3: Condition (using Amazon's published condition scale)
+    # Build Check 3: Condition (Deterministic mapping to Amazon condition scale)
+    amazon_cond, cond_verdict, cond_conf, cond_rule = map_condition(obs.condition)
+    cond_evidence = [
+        EvidenceItem(
+            evidence_id=f"ev_cond_{record_suffix}",
+            claim=obs.condition.claim,
+            evidence_type="visual_assessment",
+            source=obs.condition.source_image,
+            observation=f"{obs.condition.detail} [Classification: {cond_rule}]",
+            confidence=cond_conf,
+        )
+    ]
     condition_check = CheckResult(
         check_key="condition",
-        verdict=Verdict.PASS,
-        confidence=0.85,
-        detail="Item package is opened but merchandise appears pristine and unused. Minor outer package shelf scuffing.",
-        evidence=[
-            EvidenceItem(
-                evidence_id="ev_cond_001",
-                claim="Product condition satisfies Amazon Like New criteria",
-                evidence_type="visual_assessment",
-                source=image_records[0].filename if image_records else "inspection_camera_1",
-                observation="Packaging opened; contents pristine with no signs of wear, stains, or functional damage.",
-                confidence=0.85,
-            )
-        ],
-        observed_state=ObservedState.OPENED_UNUSED,
-        amazon_condition=AmazonCondition.LIKE_NEW,
-        model_version=f"{GEMINI_MODEL} (mock)",
-        latency_ms=110,
+        verdict=cond_verdict,
+        confidence=cond_conf,
+        detail=f"{obs.condition.detail} (Graded {amazon_cond.value}: {cond_rule})",
+        evidence=cond_evidence,
+        observed_state=obs.condition.observed_state,
+        amazon_condition=amazon_cond,
+        model_version=vision_result.model_version,
+        latency_ms=0,
     )
 
+    # 4. Deterministic Disposition Engine
+    if not vision_result.success:
+        disposition = Disposition.PENDING_REVIEW
+        rule_trace = f"pipeline_failure: {vision_result.error_message} → pending_review"
+        record_status = RecordStatus.PENDING
+        outcome_conf = 0.0
+    elif obs.identity.verdict != Verdict.PASS:
+        disposition = Disposition.PENDING_REVIEW
+        rule_trace = f"identity={obs.identity.verdict.value} → pending_review (Rule R01/R02)"
+        record_status = RecordStatus.REVIEW
+        outcome_conf = obs.identity.confidence
+    elif obs.completeness.verdict == Verdict.UNCERTAIN or cond_verdict == Verdict.UNCERTAIN:
+        disposition = Disposition.PENDING_REVIEW
+        rule_trace = f"completeness={obs.completeness.verdict.value}, condition={cond_verdict.value} → pending_review (Rule R03/R10)"
+        record_status = RecordStatus.REVIEW
+        outcome_conf = min(obs.completeness.confidence, cond_conf)
+    elif obs.completeness.verdict == Verdict.PASS:
+        if amazon_cond in (AmazonCondition.NEW, AmazonCondition.LIKE_NEW):
+            disposition = Disposition.RESTOCK
+            rule_trace = f"identity=PASS ∧ completeness=PASS ∧ condition={amazon_cond.value} → restock (Rule R04/R05)"
+        elif amazon_cond in (AmazonCondition.VERY_GOOD, AmazonCondition.GOOD):
+            disposition = Disposition.REFURBISH
+            rule_trace = f"identity=PASS ∧ completeness=PASS ∧ condition={amazon_cond.value} → refurbish (Rule R06/R07)"
+        elif amazon_cond == AmazonCondition.ACCEPTABLE:
+            disposition = Disposition.LIQUIDATE
+            rule_trace = f"identity=PASS ∧ completeness=PASS ∧ condition={amazon_cond.value} → liquidate (Rule R08)"
+        elif amazon_cond == AmazonCondition.UNACCEPTABLE:
+            disposition = Disposition.DISPOSE
+            rule_trace = f"identity=PASS ∧ completeness=PASS ∧ condition={amazon_cond.value} → dispose (Rule R09)"
+        else:
+            disposition = Disposition.PENDING_REVIEW
+            rule_trace = "condition=UNCERTAIN → pending_review"
+        record_status = RecordStatus.COMPLETED
+        outcome_conf = round((obs.identity.confidence + obs.completeness.confidence + cond_conf) / 3.0, 2)
+    else:  # completeness == Verdict.FAIL
+        if amazon_cond in (AmazonCondition.NEW, AmazonCondition.LIKE_NEW, AmazonCondition.VERY_GOOD):
+            disposition = Disposition.REFURBISH
+            rule_trace = f"completeness=FAIL ∧ condition={amazon_cond.value} → refurbish (Rule R11)"
+        elif amazon_cond in (AmazonCondition.GOOD, AmazonCondition.ACCEPTABLE):
+            disposition = Disposition.LIQUIDATE
+            rule_trace = f"completeness=FAIL ∧ condition={amazon_cond.value} → liquidate (Rule R12)"
+        else:
+            disposition = Disposition.DISPOSE
+            rule_trace = f"completeness=FAIL ∧ condition={amazon_cond.value} → dispose (Rule R13)"
+        record_status = RecordStatus.COMPLETED
+        outcome_conf = round((obs.identity.confidence + obs.completeness.confidence + cond_conf) / 3.0, 2)
+
     outcome = OutcomeResult(
-        disposition=Disposition.RESTOCK,
-        amazon_condition=AmazonCondition.LIKE_NEW,
-        rule_trace="identity=PASS ∧ completeness=PASS ∧ condition=LikeNew → restock (Rule R05)",
-        confidence=0.85,
+        disposition=disposition,
+        amazon_condition=amazon_cond,
+        rule_trace=rule_trace,
+        confidence=outcome_conf,
     )
 
     subject = SubjectInfo(
@@ -172,15 +271,14 @@ async def process_return(request: ReturnAssessmentRequest) -> EvidenceRecord:
         checks=[identity_check, completeness_check, condition_check],
         outcome=outcome,
         overrides=[],
-        status=RecordStatus.COMPLETED,
+        status=record_status,
         content_hash=None,
     )
 
-    # Compute content hash over the record payload (excluding content_hash itself)
+    # 5. Content Hash and Storage
     record_dict = evidence_record.model_dump(mode="json", exclude={"content_hash"})
     evidence_record.content_hash = _compute_content_hash(record_dict)
 
-    # Save to tenant-isolated SQLite storage
     save_record(evidence_record)
 
     return evidence_record

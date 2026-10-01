@@ -138,6 +138,40 @@ You do not need to create a participant folder in the organiser repository or op
    * Interactive API docs: `http://localhost:8000/docs`
    * Main operation: `POST http://localhost:8000/agent`
 
+### Phase 2: Multimodal Vision Pipeline Setup
+
+1. **Configure Gemini API Key:**
+   Add your Gemini API key in `.env`:
+   ```sh
+   GEMINI_API_KEY=your_actual_gemini_api_key
+   GEMINI_MODEL=gemini-2.5-flash
+   ```
+
+2. **Image Input Format:**
+   Images can be provided directly via `POST /agent` as base64-encoded strings (JPEG, PNG, WEBP, GIF) or local file paths:
+   ```json
+   {
+     "organization_id": "org_demo_alpha",
+     "unit_id": "UNIT-0003",
+     "order_id": "ORD-DUMMY-50003",
+     "ordered_sku": "SKU-PUZZLE-500",
+     "ordered_asin": "B0DUMMY729",
+     "parts_list": ["puzzle pieces", "poster"],
+     "operator_id": "op_chen",
+     "images": [
+       {
+         "filename": "parcel_overview.jpg",
+         "content_type": "image/jpeg",
+         "data": "<base64_encoded_jpeg>"
+       }
+     ]
+   }
+   ```
+
+3. **Conservative Uncertainty Handling (RULES.md §2.3 & §2.4):**
+   * **First-Class UNCERTAIN:** When photographs are obscured, accessories cannot be confirmed, or markings are unreadable, checks output `UNCERTAIN` and the parcel routes to `pending_review`.
+   * **Fail Open:** If `GEMINI_API_KEY` is not configured, or if the vision API encounters a network timeout, the system does not crash or fabricate decisions. It records a structured evidence record with `UNCERTAIN` verdicts, `pending_review` disposition, and documents the failure reason for human review.
+
 ---
 
 ## What you should focus on
